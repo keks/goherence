@@ -37,7 +37,7 @@ const (
 )
 
 type AppState struct {
-	Wat, Line, Send *goherence.Entry
+	Wat, Line, Send goherence.Partial
 }
 
 func fileServer(name string) http.Handler {
@@ -52,55 +52,76 @@ func main() {
 		Funcs(goherence.TemplateFuncs).
 		Parse(TemplateRoot))
 
-	cchr := goherence.NewCacher()
+	obvRenderFunc := goherence.TemplateRenderFunc2(tpl, "simple-obv")
+
 
 	lineObv, lineWork := LineObservable(os.Stdin)
-	lineEntry := &goherence.Entry{
-		ID: "line",
-		Time: time.Now(),
-		Observable: lineObv,
-	}
+	linePartial := goherence.NewObservablePartial("line", obvRenderFunc, lineObv)
 
 	sendObv := luigi.NewObservable("send something!")
-	sendEntry := &goherence.Entry{
-		ID: "send",
-		Time: time.Now(),
-		Observable: sendObv,
-	}
+	sendPartial := goherence.NewObservablePartial("send", obvRenderFunc, sendObv)
 
 	watObv := luigi.NewObservable(0)
-	watEntry := &goherence.Entry{
-		ID: "wat",
-		Time: time.Now(),
-		Observable: watObv,
-	}
+	watPartial := goherence.NewObservablePartial("wat", obvRenderFunc, watObv)
 
-	cchr.RegisterObservable("wat", goherence.TemplateRenderFunc(tpl, "simple-obv"), watObv)
-	cchr.RegisterObservable("line", goherence.TemplateRenderFunc(tpl, "simple-obv"), lineObv)
-	cchr.RegisterObservable("send", goherence.TemplateRenderFunc(tpl, "simple-obv"), sendObv)
+	srv := goherence.NewServer()
+	srv.RegisterObservable("wat", obvRenderFunc, watObv)
+	srv.RegisterObservable("line", obvRenderFunc, lineObv)
+	srv.RegisterObservable("send", obvRenderFunc, sendObv)
 
 	mux := http.NewServeMux()
 	mux.Handle("/coherence.js", fileServer("assets/coherence.js"))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
-			cchr.ServeHTTP(w, r)
+			srv.ServeHTTP(w, r)
 			return 
 		}
 
 		if r.Method == "POST" {
 			v := r.FormValue("msg")
 			fmt.Println("received value for send:", v)
-			sendObv.Set(v)
+			err := sendObv.Set(v)
+			if err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
 		}
 
-		tpl.ExecuteTemplate(w, "root", &AppState{watEntry, lineEntry, sendEntry})
+		should := func(v interface{}, err error) interface{} {
+			if err != nil {
+				return err.Error()
+			}
+
+			return v
+		}
+
+		err := tpl.ExecuteTemplate(w, "root", &AppState{
+			goherence.TemplateData{
+				Partial: watPartial,
+				Value: should(watObv.Value()),
+			},
+			goherence.TemplateData{
+				Partial: linePartial,
+				Value: should(lineObv.Value()),
+			},
+			goherence.TemplateData{
+				Partial: sendPartial,
+				Value: should(sendObv.Value()),
+			},
+		})
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+		}
 	})
 
 	go lineWork()
 	go func() {
 		i := 0
-		for range time.Tick(20*time.Second) {
-			watObv.Set(i)
+		for range time.Tick(2*time.Second) {
+			err := watObv.Set(i)
+			if err != nil {
+				fmt.Println("error setting wat:", err)
+			}
 			i++
 		}
 	}()
