@@ -5,105 +5,69 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 	"strconv"
 	"sync"
 	"time"
 
 	"go.cryptoscope.co/luigi"
-	"go.cryptoscope.co/margaret"
 )
 
-type Cacher interface {
-	RegisterObservable(id string, rf RenderFunc, obv luigi.Observable)
-	RegisterLog(id string, rf RenderFunc, obv margaret.Log)
-
-	http.Handler
+type logLocker struct {
+	l sync.Locker
+	name string
 }
 
-func NewCacher() Cacher {
-	var (
-		mux = http.NewServeMux()
-		unblock, wait = luigi.NewBroadcast()
-		c   = &cacher{
-			start:     time.Now(),
-			entries:   map[string]*Entry{},
-			renderers: map[string]RenderFunc{},
-			wait: wait,
-			unblock: unblock,
-			httpMux:   mux,
-		}
-	)
+func (ll logLocker) Lock() {
+	fmt.Printf("wait for lock %q\n", ll.name)
+	ll.l.Lock()
+	fmt.Printf("acquired lock %q\n", ll.name)
+}
 
-	mux.HandleFunc("/coherence/cache", c.serveCacheHTTP)
-	mux.HandleFunc("/partial/", c.servePartialHTTP)
-
-	return c
+func (ll logLocker) Unlock() {
+	ll.l.Unlock()
+	fmt.Printf("released lock %q\n", ll.name)
 }
 
 type cacher struct {
-	l sync.Mutex
-
-	start time.Time
-
-	// renderers contains the RenderFuncs for the particular partials
-	renderers map[string]RenderFunc
-
-	// entries contains the most recently written Entry of the observable
-	// only for the cache page
-	// TODO how to generelize this to streams?
-	//  	maybe as a linked list?
-	//   -> idea: use logs instead of streams,
-	//            and query them in the partial
-	entries map[string]*Entry
+	l sync.Locker
 
 	// used to unblock the cache page when new data arrives
 	wait luigi.Broadcast
 	unblock luigi.Sink
+	
+	start int64
+	times map[string]int64
 
-	// 
-	httpMux *http.ServeMux
+	cacheData cacheData
 }
 
-func (c *cacher) RegisterObservable(id string, rf RenderFunc, obv luigi.Observable) {
-	c.l.Lock()
-	defer c.l.Unlock()
+type cacheLine struct {
+	id string
+	// ms is the number if milliseconds passed since 1970-01-01.
+	// sounds crazy if you put it that way...
+	ms int64
+}
 
-	c.renderers[id] = rf
-	c.entries[id] = &Entry{
-		Observable: obv,
-	}
+type cacheData struct {
+	IDs   map[string]int64 `json:"ids"`
+	Start int64            `json:"start"`
+}
 
-	obv.Register(luigi.FuncSink(func(ctx context.Context, v interface{}, err error) error {
-		if err != nil {
-			fmt.Printf("obv handler for %q received an error %s\n", id, err)
-			return nil
+func newCacher() *cacher {
+	var (
+		unblock, wait = luigi.NewBroadcast()
+		c = &cacher {
+			wait: wait,
+			unblock: unblock,
+			cacheData: cacheData{
+				IDs: make(map[string]int64),
+			},
+			//l: logLocker{&sync.Mutex{}, "cache"},
+			l: &sync.Mutex{},
 		}
-
-		c.l.Lock()
-		defer c.l.Unlock()
-
-		c.entries[id].ID = id
-		c.entries[id].Time = time.Now()
-
-		c.unblock.Pour(ctx, nil)
-
-		return nil
-	}))
-}
-
-func (c *cacher) RegisterLog(id string, rf RenderFunc, log margaret.Log) {}
-
-func (c *cacher) servePartialHTTP(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/partial/")
-
-	e, ok := c.entries[id]
-	if !ok {
-		http.Error(w, "Not Found", 404)
-		return
-	}
-
-	c.renderers[id](e).ServeHTTP(w, r)
+	)
+	
+	return c
 }
 
 func getSince(r *http.Request) (int64, *Error) {
@@ -122,46 +86,47 @@ func getSince(r *http.Request) (int64, *Error) {
 	return int64(since), nil
 }
 
-func (c *cacher) serveCacheHTTP(w http.ResponseWriter, r *http.Request) {
-	since, err := getSince(r)
-	if err != nil {
-		err.ServeHTTP(w, r)
+func (c *cacher) Invalidate(ctx context.Context, id string) error {
+	ms := millis(time.Now())
+
+	func () {
+		c.l.Lock()
+		defer c.l.Unlock()
+
+		c.cacheData.IDs[id] = millis(time.Now())
+	}()
+
+	return c.unblock.Pour(ctx, cacheLine{
+		id: id,
+		ms: ms,
+	})
+}
+
+func (c *cacher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	since, sinceErr := getSince(r)
+	if sinceErr != nil {
+		sinceErr.ServeHTTP(w, r)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	enc := json.NewEncoder(w)
-
-	type cacheData struct {
-		IDs   map[string]int64 `json:"ids"`
-		Start int64            `json:"start"`
-	}
-
 	data := cacheData{
-		make(map[string]int64),
-		millis(c.start),
+		IDs: make(map[string]int64),
+		Start: c.start,
 	}
 
-	var wait sync.Mutex
+	c.l.Lock()
+	defer c.l.Unlock()
 
-	for {
-		for name, entry := range c.entries {
-			ms := millis(entry.Time)
-
-			// skip older stuff
-			if int64(since) >= ms {
-				continue
-			}
-
-			data.IDs[name] = ms
+	for id, ms := range c.cacheData.IDs {
+		fmt.Println(id, ms, since)
+		if ms > since {
+			data.IDs[id] = ms
 		}
+	}
 
-		// if we have data, push it!
-		if len(data.IDs) > 0 {
-			fmt.Println(data)
-			break
-		}
-
+	// no new data available! wait for more
+	if len(data.IDs) == 0 {
+		fmt.Println("no new data available! wait for more")
 		// This is a funny construction:
 		// The idea is that we take a lock two times (the second time blocks).
 		// At the same time, we register a broadcast listener for new data.
@@ -171,14 +136,36 @@ func (c *cacher) serveCacheHTTP(w http.ResponseWriter, r *http.Request) {
 		// the blocking has to happen *outside the global lock* because
 		//     otherwise no data can be written.
 
+		var wait sync.Mutex
+
 		// Take lock the first time
 		wait.Lock()
 
+		var (
+			line cacheLine
+		)
+
 		var once sync.Once
-		unreg := c.wait.Register(luigi.FuncSink(func(context.Context, interface{}, error) error {
+		unreg := c.wait.Register(luigi.FuncSink(func(ctx context.Context, v interface{}, err error) error {
+			fmt.Println("waiting for once")
 			once.Do(func() {  // only run this code once!
 				wait.Unlock() // unlock (and unblock below) once we have data
 			})
+
+			// usually you don't do that, but we
+			// don't expect any errors here so 
+			// if we get one here, that's an error
+			// on the sending side.
+			if err != nil {
+				return err
+			}
+
+			var ok bool
+
+			line, ok = v.(cacheLine)
+			if !ok {
+				return fmt.Errorf("broadcast: expected id value to be of type %T, got %T", line, v)
+			}
 
 			return nil
 		}))
@@ -188,16 +175,16 @@ func (c *cacher) serveCacheHTTP(w http.ResponseWriter, r *http.Request) {
 		unreg()       // unregister the handler
 		wait.Unlock() // clean up and prepare for another iteration
 		c.l.Lock()    // take the global lock again
+
+		// funny construction ends here
+
+		data.IDs[line.id] = line.ms 
 	}
+
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
 
 	// this only prints an error if there was one
 	wrapError("error encoding json", enc.Encode(data), 500).ServeHTTP(w, r)
 }
 
-func (c *cacher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Connection", "keep-alive")
-	c.l.Lock()
-	defer c.l.Unlock()
-
-	c.httpMux.ServeHTTP(w, r)
-}

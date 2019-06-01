@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"html/template"
 	"io"
@@ -11,6 +12,9 @@ import (
 
 	"go.cryptoscope.co/goherence"
 	"go.cryptoscope.co/luigi"
+	memmarge "go.cryptoscope.co/margaret/mem"
+
+	"github.com/keks/marx"
 )
 
 const (
@@ -23,21 +27,32 @@ const (
 <body>
 <div>regular div</div>
 
-{{- block "simple-obv" .Line -}}
+{{- define "simple-obv" -}}
 <div {{ attrs . }}> {{ .ID }}: {{ .Value }} </div>
 {{end -}}
+{{ define "simple-log" -}}
+<div class="{{.ID}}">
+	{{ .Timestamp }} {{ .Value }} 
+</div>
+{{ end -}}
 
-{{ template "simple-obv" .Wat }}
-{{ template "simple-obv" .Send }}
-<form method="POST">
+{{ .Line.HTML }}
+{{ .Wat.HTML }}
+{{ .Send.HTML }}
+{{ block "simple-form" "send" -}}
+<form method="POST" action="endpoint/{{ . }}">
 	<input type="text" name="msg">
-	<input type="submit" value="send it">
+	<input type="submit" value="{{ . }} it">
 </form>
+{{ end }}
+
+{{.Chat.HTML}}
+{{ template "simple-form" "chat" -}}
 `
 )
 
 type AppState struct {
-	Wat, Line, Send goherence.Partial
+	Wat, Line, Send, Chat goherence.Partial
 }
 
 func fileServer(name string) http.Handler {
@@ -52,25 +67,57 @@ func main() {
 		Funcs(goherence.TemplateFuncs).
 		Parse(TemplateRoot))
 
-	obvRenderFunc := goherence.TemplateRenderFunc2(tpl, "simple-obv")
-
+	obvRenderFunc := goherence.TemplateRenderFunc(tpl, "simple-obv")
+	chatRenderFunc := goherence.TemplateRenderFunc(tpl, "simple-log")
 
 	lineObv, lineWork := LineObservable(os.Stdin)
-	linePartial := goherence.NewObservablePartial("line", obvRenderFunc, lineObv)
-
 	sendObv := luigi.NewObservable("send something!")
-	sendPartial := goherence.NewObservablePartial("send", obvRenderFunc, sendObv)
-
 	watObv := luigi.NewObservable(0)
-	watPartial := goherence.NewObservablePartial("wat", obvRenderFunc, watObv)
+
 
 	srv := goherence.NewServer()
-	srv.RegisterObservable("wat", obvRenderFunc, watObv)
-	srv.RegisterObservable("line", obvRenderFunc, lineObv)
-	srv.RegisterObservable("send", obvRenderFunc, sendObv)
+	watPartial := srv.RegisterObservable("wat", obvRenderFunc, watObv)
+	linePartial := srv.RegisterObservable("line", obvRenderFunc, lineObv)
+	sendPartial := srv.RegisterObservable("send", obvRenderFunc, sendObv)
+
+	chatLog := memmarge.New()
+	chatPartial, chatWork, err := 	srv.RegisterLog("chat", chatRenderFunc, chatLog)
+	if err != nil {
+		panic(err)
+	}
+
+	var httpSrv *http.Server
+
+	epMux := http.NewServeMux()
+	epMux.HandleFunc("/send", func(w http.ResponseWriter, r *http.Request) {
+		v := r.FormValue("msg")
+		fmt.Println("received value for send:", v)
+		err := sendObv.Set(v)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+	})
+	epMux.HandleFunc("/chat", func(w http.ResponseWriter, r *http.Request) {
+		v := r.FormValue("msg")
+		fmt.Println("received value for chat:", v)
+		_, err := chatLog.Append(v)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+	})
+	epMux.HandleFunc("/halt", func(w http.ResponseWriter, r *http.Request) {
+		go httpSrv.Shutdown(context.Background())
+		fmt.Fprintf(w, "shutting down")
+	})
 
 	mux := http.NewServeMux()
 	mux.Handle("/coherence.js", fileServer("assets/coherence.js"))
+	mux.HandleFunc("/endpoint/",  func(w http.ResponseWriter, r *http.Request) {
+		http.StripPrefix("/endpoint", epMux).ServeHTTP(w, r)
+		http.Redirect(w, r, "/", http.StatusFound)
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			srv.ServeHTTP(w, r)
@@ -108,42 +155,86 @@ func main() {
 				Partial: sendPartial,
 				Value: should(sendObv.Value()),
 			},
+			goherence.TemplateData{
+				Partial: chatPartial,
+				Value: "????",
+			},
 		})
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 		}
 	})
 
-	go lineWork()
-	go func() {
+	httpSrv = &http.Server{
+		Addr: BindAddr,
+		Handler: mux,
+	}
+
+	watWork := marx.Worker(func(ctx context.Context) error {
+		defer fmt.Println("wat on strike")
+
+		ticker := time.Tick(5*time.Second)
 		i := 0
-		for range time.Tick(2*time.Second) {
+		for  {
+			select{
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-ticker:
+			}
+
+			fmt.Println("wat: setting...")
 			err := watObv.Set(i)
 			if err != nil {
-				fmt.Println("error setting wat:", err)
+				return err
 			}
+			fmt.Println("wat: new value set.")
 			i++
 		}
-	}()
 
-	err := http.ListenAndServe(BindAddr, mux)
-	if err != nil {
+		return nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	httpWork := marx.Worker(func(ctx context.Context) error {
+		defer fmt.Println("http done, cancel called")
+		defer cancel()
+		return httpSrv.ListenAndServe()
+	})
+
+	workers := marx.Unite(
+		httpWork,
+		chatWork,
+		lineWork,
+		watWork,
+	)
+
+	if err := workers(ctx); err != nil {
 		panic(err)
 	}
 }
 
-func LineObservable(r io.Reader) (luigi.Observable, func()) {
+func LineObservable(r io.Reader) (luigi.Observable, func(ctx context.Context) error) {
 	o := luigi.NewObservable("...line...")
 
-	return o, func() {
+	return o, func(ctx context.Context) error {
+		defer fmt.Println("line worker on strike")
 		br := bufio.NewReader(r)
 		for {
+			select{
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+
 			str, err := br.ReadString('\n')
 			if err != nil {
-				o.Set("error reading: " + err.Error())
-				return
+				return err
 			}
-			o.Set(str)
+
+			err = o.Set(str)
+			if err != nil {
+				return err
+			}
 		}
 	}
 }
