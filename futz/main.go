@@ -32,7 +32,7 @@ const (
 {{ end -}}
 
 {{ define "simple-form" -}}
-<form method="POST" action="endpoint/{{ . }}">
+<form method="POST" action="endpoint/{{ . }}" data-reset="true">
 	<input type="text" name="msg">
 	<input type="submit" value="{{ . }} it">
 </form>
