@@ -21,32 +21,34 @@ const (
 	BindAddr = ":3001"
 
 	TemplateRoot = `
-
-<html>
-<script type="text/javascript" src="coherence.js"></script>
-<body>
-<div>regular div</div>
-
 {{- define "simple-obv" -}}
 <div {{ attrs . }}> {{ .ID }}: {{ .Value }} </div>
-{{end -}}
+{{ end -}}
+
 {{ define "simple-log" -}}
 <div class="{{.ID}}">
 	{{ .Timestamp }} {{ .Value }} 
 </div>
 {{ end -}}
 
-{{ .Line.HTML }}
-{{ .Wat.HTML }}
-{{ .Send.HTML }}
-{{ block "simple-form" "send" -}}
+{{ define "simple-form" -}}
 <form method="POST" action="endpoint/{{ . }}">
 	<input type="text" name="msg">
 	<input type="submit" value="{{ . }} it">
 </form>
-{{ end }}
+{{ end -}}
 
-{{.Chat.HTML}}
+<html>
+<head>
+	<script type="text/javascript" src="coherence.js"></script>
+</head>
+<body>
+<div>regular div</div>
+{{ .Line.HTML -}}
+{{ .Wat.HTML -}}
+{{ .Send.HTML -}}
+{{ template "simple-form" "send" -}}
+{{.Chat.HTML -}}
 {{ template "simple-form" "chat" -}}
 `
 )

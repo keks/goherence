@@ -203,7 +203,7 @@ func (lp *LogPartial) streamHandler(src luigi.Source, rf RenderFunc, since int64
 func (lp *LogPartial) latestHandler(since int64) http.Handler {
 	fmtStr := `<div data-id="%s-latest" data-href="/%s?since=%d" data-ts="%d"></div>`
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, fmtStr, lp.id, lp.id, since, lp.time)
+		fmt.Fprintf(w, fmtStr, lp.id, lp.id, since, millis(lp.time))
 	})
 }
 
@@ -231,7 +231,7 @@ func (lp *LogPartial) HTML() template.HTML {
 	str := func() string {
 		var (
 			buf bytes.Buffer
-			since margaret.Seq
+			since margaret.Seq = margaret.SeqEmpty
 		)
 
 		src, err := lp.Log.Query(
@@ -263,7 +263,7 @@ func (lp *LogPartial) HTML() template.HTML {
 		}
 
 		fmtStr := `<div data-id="%s-latest" data-href="/%s?since=%d" data-ts="%d"></div>`
-		fmt.Fprintf(&buf, fmtStr, lp.id, lp.id, since, lp.time)
+		fmt.Fprintf(&buf, fmtStr, lp.id, lp.id, since.Seq(), millis(lp.time))
 
 		return buf.String()
 	}()
