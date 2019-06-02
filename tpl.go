@@ -5,14 +5,9 @@ import (
 	"html/template"
 	"io"
 	"net/http"
-	"time"
 )
 
 var TemplateFuncs template.FuncMap
-
-func millis(t time.Time) int64 {
-	return t.UnixNano() / 1000000
-}
 
 func init() {
 	TemplateFuncs = template.FuncMap{
@@ -29,24 +24,6 @@ type TemplateData struct {
 	Partial
 
 	Value interface{}
-}
-
-type writerToFunc func(w io.Writer) (int64, error)
-
-func (wt writerToFunc) WriteTo(w io.Writer) (int64, error) {
-	return wt(w)
-}
-
-type countWriter struct {
-	n int64
-	w io.Writer
-}
-
-func (cw *countWriter) Write(data []byte) (int, error) {
-	n, err := cw.w.Write(data)
-	cw.n += int64(n)
-
-	return n, err
 }
 
 func writerToHandler(wt io.WriterTo) http.Handler {
@@ -69,11 +46,10 @@ func TemplateRenderFunc(tpl *template.Template, name string) RenderFunc {
 
 			err := tpl.ExecuteTemplate(cw, name, TemplateData{
 				Partial: p,
-				Value: v,
+				Value:   v,
 			})
 
 			return cw.n, err
 		})
 	}
 }
-

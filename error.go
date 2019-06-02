@@ -22,8 +22,8 @@ func wrapError(msg string, cause error, status int) *Error {
 func newError(msg string, cause error, status int) *Error {
 	return &Error{
 		Message: msg,
-		Cause: cause,
-		Status: status,
+		Cause:   cause,
+		Status:  status,
 	}
 }
 
@@ -46,4 +46,3 @@ func (err *Error) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	http.Error(w, err.Error(), err.Status)
 }
-

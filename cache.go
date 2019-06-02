@@ -5,36 +5,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strconv"
 	"sync"
 	"time"
 
 	"go.cryptoscope.co/luigi"
 )
 
-type logLocker struct {
-	l sync.Locker
-	name string
-}
-
-func (ll logLocker) Lock() {
-	fmt.Printf("wait for lock %q\n", ll.name)
-	ll.l.Lock()
-	fmt.Printf("acquired lock %q\n", ll.name)
-}
-
-func (ll logLocker) Unlock() {
-	ll.l.Unlock()
-	fmt.Printf("released lock %q\n", ll.name)
-}
-
 type cacher struct {
 	l sync.Locker
 
 	// used to unblock the cache page when new data arrives
-	wait luigi.Broadcast
+	wait    luigi.Broadcast
 	unblock luigi.Sink
-	
+
 	start int64
 	times map[string]int64
 
@@ -56,8 +39,8 @@ type cacheData struct {
 func newCacher() *cacher {
 	var (
 		unblock, wait = luigi.NewBroadcast()
-		c = &cacher {
-			wait: wait,
+		c             = &cacher{
+			wait:    wait,
 			unblock: unblock,
 			cacheData: cacheData{
 				IDs: make(map[string]int64),
@@ -66,30 +49,14 @@ func newCacher() *cacher {
 			l: &sync.Mutex{},
 		}
 	)
-	
+
 	return c
-}
-
-func getSince(r *http.Request) (int64, *Error) {
-	sinceStr := r.URL.Query()["since"][0]
-	if sinceStr == "" {
-		return 0, newError(`missing query parameter "since"`, nil, 400)
-	}
-
-	since, err := strconv.Atoi(sinceStr)
-	if err != nil {
-		return 0, newError(
-			`error parsing query parameter "since"`,
-			err, 400)
-	}
-
-	return int64(since), nil
 }
 
 func (c *cacher) Invalidate(ctx context.Context, id string) error {
 	ms := millis(time.Now())
 
-	func () {
+	func() {
 		c.l.Lock()
 		defer c.l.Unlock()
 
@@ -110,7 +77,7 @@ func (c *cacher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data := cacheData{
-		IDs: make(map[string]int64),
+		IDs:   make(map[string]int64),
 		Start: c.start,
 	}
 
@@ -147,13 +114,12 @@ func (c *cacher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		var once sync.Once
 		unreg := c.wait.Register(luigi.FuncSink(func(ctx context.Context, v interface{}, err error) error {
-			fmt.Println("waiting for once")
-			once.Do(func() {  // only run this code once!
+			once.Do(func() { // only run this code once!
 				wait.Unlock() // unlock (and unblock below) once we have data
 			})
 
 			// usually you don't do that, but we
-			// don't expect any errors here so 
+			// don't expect any errors here so
 			// if we get one here, that's an error
 			// on the sending side.
 			if err != nil {
@@ -178,7 +144,7 @@ func (c *cacher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		// funny construction ends here
 
-		data.IDs[line.id] = line.ms 
+		data.IDs[line.id] = line.ms
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -187,4 +153,3 @@ func (c *cacher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// this only prints an error if there was one
 	wrapError("error encoding json", enc.Encode(data), 500).ServeHTTP(w, r)
 }
-

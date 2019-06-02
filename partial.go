@@ -20,6 +20,9 @@ type Partial interface {
 	Href() string
 	Timestamp() time.Time
 
+	InvalidateID() string
+
+	luigi.Broadcast
 	http.Handler
 	HTML() template.HTML
 }
@@ -28,13 +31,14 @@ type StaticPartial struct {
 	Value interface{}
 
 	id, href string
-	ts time.Time
-	rf RenderFunc
+	ts       time.Time
+	rf       RenderFunc
 }
 
-func (sp StaticPartial) ID() string {return sp.id}
-func (sp StaticPartial) Href() string {return sp.href}
-func (sp StaticPartial) Timestamp() time.Time {return sp.ts}
+func (sp StaticPartial) ID() string           { return sp.id }
+func (sp StaticPartial) InvalidateID() string { return sp.id }
+func (sp StaticPartial) Href() string         { return sp.href }
+func (sp StaticPartial) Timestamp() time.Time { return sp.ts }
 
 func (sp StaticPartial) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	writerToHandler(sp.rf(sp.Value, sp)).ServeHTTP(w, r)
@@ -50,22 +54,24 @@ func (sp StaticPartial) HTML() template.HTML {
 	return template.HTML(buf.String())
 }
 
+func (sp StaticPartial) Register(luigi.Sink) func() { return func() {} }
+
 type ObservablePartial struct {
 	Observable luigi.Observable
 
-	id string
+	id   string
 	time time.Time
-	rf RenderFunc
-	l sync.Mutex
-	v interface{}
+	rf   RenderFunc
+	l    sync.Mutex
+	v    interface{}
 }
 
 func NewObservablePartial(id string, rf RenderFunc, obv luigi.Observable) *ObservablePartial {
 	op := &ObservablePartial{
-		id: id,	
-		rf: rf,
+		id:         id,
+		rf:         rf,
 		Observable: obv,
-		time: time.Now(),
+		time:       time.Now(),
 	}
 
 	op.Observable.Register(
@@ -78,7 +84,7 @@ func NewObservablePartial(id string, rf RenderFunc, obv luigi.Observable) *Obser
 				op.v = v
 
 				return nil
-	}))
+			}))
 
 	return op
 }
@@ -87,11 +93,12 @@ func (op *ObservablePartial) handler() http.Handler {
 	return writerToHandler(op.rf(op.v, op))
 }
 
-func (op *ObservablePartial) ID() string {return op.id}
+func (op *ObservablePartial) ID() string           { return op.id }
+func (op *ObservablePartial) InvalidateID() string { return op.id }
 func (op *ObservablePartial) Href() string {
 	return fmt.Sprintf("/%s", op.id)
 }
-func (op *ObservablePartial) Timestamp() time.Time {return op.time}
+func (op *ObservablePartial) Timestamp() time.Time { return op.time }
 
 func (op *ObservablePartial) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	op.handler().ServeHTTP(w, r)
@@ -107,11 +114,15 @@ func (op *ObservablePartial) HTML() template.HTML {
 	return template.HTML(buf.String())
 }
 
+func (op *ObservablePartial) Register(sink luigi.Sink) func() {
+	return op.Observable.Register(sink)
+}
+
 func NewLogPartial(id string, rf RenderFunc, log margaret.Log) (*LogPartial, marx.Worker, error) {
 	lp := &LogPartial{
-		id: id,	
-		rf: rf,
-		Log: log,
+		id:   id,
+		rf:   rf,
+		Log:  log,
 		time: time.Now(),
 	}
 
@@ -149,12 +160,12 @@ func NewLogPartial(id string, rf RenderFunc, log margaret.Log) (*LogPartial, mar
 type LogPartial struct {
 	Log margaret.Log
 
-	id string
+	id   string
 	time time.Time
-	rf RenderFunc
+	rf   RenderFunc
 
-	l sync.Mutex
-	v interface{}
+	l   sync.Mutex
+	v   interface{}
 	seq margaret.Seq
 }
 
@@ -187,9 +198,9 @@ func (lp *LogPartial) streamHandler(src luigi.Source, rf RenderFunc, since int64
 	// return the handler that iterates over the stream
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var (
-			h http.Handler
+			h    http.Handler
 			more bool = true
-			ctx = r.Context()
+			ctx       = r.Context()
 		)
 
 		for more {
@@ -201,9 +212,9 @@ func (lp *LogPartial) streamHandler(src luigi.Source, rf RenderFunc, since int64
 
 // latestHandler returns an http handler that prints the latest-div (for autoupdates)
 func (lp *LogPartial) latestHandler(since int64) http.Handler {
-	fmtStr := `<div data-id="%s-latest" data-href="/%s?since=%d" data-ts="%d"></div>`
+	fmtStr := `<div data-id="%s" data-href="/%s?since=%d" data-ts="%d"></div>`
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, fmtStr, lp.id, lp.id, since, millis(lp.time))
+		fmt.Fprintf(w, fmtStr, lp.InvalidateID(), lp.id, since, millis(lp.time))
 	})
 }
 
@@ -220,17 +231,18 @@ func (lp *LogPartial) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.ServeHTTP(w, r)
 }
 
-func (lp *LogPartial) ID() string {return lp.id}
+func (lp *LogPartial) ID() string           { return lp.id }
+func (lp *LogPartial) InvalidateID() string { return lp.id + "-latest" }
 func (lp *LogPartial) Href() string {
 	// TODO put the sequence number here
 	return fmt.Sprintf("/%d?since=TODO", lp.id)
 }
-func (lp *LogPartial) Timestamp() time.Time {return lp.time}
+func (lp *LogPartial) Timestamp() time.Time { return lp.time }
 
 func (lp *LogPartial) HTML() template.HTML {
 	str := func() string {
 		var (
-			buf bytes.Buffer
+			buf   bytes.Buffer
 			since margaret.Seq = margaret.SeqEmpty
 		)
 
@@ -262,11 +274,15 @@ func (lp *LogPartial) HTML() template.HTML {
 			}
 		}
 
-		fmtStr := `<div data-id="%s-latest" data-href="/%s?since=%d" data-ts="%d"></div>`
-		fmt.Fprintf(&buf, fmtStr, lp.id, lp.id, since.Seq(), millis(lp.time))
+		fmtStr := `<div data-id="%s" data-href="/%s?since=%d" data-ts="%d"></div>`
+		fmt.Fprintf(&buf, fmtStr, lp.InvalidateID(), lp.id, since.Seq(), millis(lp.time))
 
 		return buf.String()
 	}()
 
 	return template.HTML(str)
+}
+
+func (lp *LogPartial) Register(sink luigi.Sink) func() {
+	return lp.Log.Seq().Register(sink)
 }

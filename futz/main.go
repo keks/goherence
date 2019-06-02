@@ -38,6 +38,11 @@ const (
 </form>
 {{ end -}}
 
+{{ define "with-form" -}}
+{{ .HTML -}}
+{{ template "simple-form" .ID -}}
+{{ end -}}
+
 <html>
 <head>
 	<script type="text/javascript" src="coherence.js"></script>
@@ -46,10 +51,8 @@ const (
 <div>regular div</div>
 {{ .Line.HTML -}}
 {{ .Wat.HTML -}}
-{{ .Send.HTML -}}
-{{ template "simple-form" "send" -}}
-{{.Chat.HTML -}}
-{{ template "simple-form" "chat" -}}
+{{ template "with-form" .Send -}}
+{{ template "with-form" .Chat -}}
 `
 )
 
@@ -66,8 +69,8 @@ func fileServer(name string) http.Handler {
 func main() {
 	tpl := template.Must(
 		template.New("root").
-		Funcs(goherence.TemplateFuncs).
-		Parse(TemplateRoot))
+			Funcs(goherence.TemplateFuncs).
+			Parse(TemplateRoot))
 
 	obvRenderFunc := goherence.TemplateRenderFunc(tpl, "simple-obv")
 	chatRenderFunc := goherence.TemplateRenderFunc(tpl, "simple-log")
@@ -76,17 +79,21 @@ func main() {
 	sendObv := luigi.NewObservable("send something!")
 	watObv := luigi.NewObservable(0)
 
-
 	srv := goherence.NewServer()
-	watPartial := srv.RegisterObservable("wat", obvRenderFunc, watObv)
-	linePartial := srv.RegisterObservable("line", obvRenderFunc, lineObv)
-	sendPartial := srv.RegisterObservable("send", obvRenderFunc, sendObv)
+	watPartial := goherence.NewObservablePartial("wat", obvRenderFunc, watObv)
+	linePartial := goherence.NewObservablePartial("line", obvRenderFunc, lineObv)
+	sendPartial := goherence.NewObservablePartial("send", obvRenderFunc, sendObv)
 
 	chatLog := memmarge.New()
-	chatPartial, chatWork, err := 	srv.RegisterLog("chat", chatRenderFunc, chatLog)
+	chatPartial, chatWork, err := goherence.NewLogPartial("chat", chatRenderFunc, chatLog)
 	if err != nil {
 		panic(err)
 	}
+
+	srv.RegisterPartial(chatPartial)
+	srv.RegisterPartial(watPartial)
+	srv.RegisterPartial(linePartial)
+	srv.RegisterPartial(sendPartial)
 
 	var httpSrv *http.Server
 
@@ -116,14 +123,14 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/coherence.js", fileServer("assets/coherence.js"))
-	mux.HandleFunc("/endpoint/",  func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/endpoint/", func(w http.ResponseWriter, r *http.Request) {
 		http.StripPrefix("/endpoint", epMux).ServeHTTP(w, r)
 		http.Redirect(w, r, "/", http.StatusFound)
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			srv.ServeHTTP(w, r)
-			return 
+			return
 		}
 
 		if r.Method == "POST" {
@@ -147,19 +154,19 @@ func main() {
 		err := tpl.ExecuteTemplate(w, "root", &AppState{
 			goherence.TemplateData{
 				Partial: watPartial,
-				Value: should(watObv.Value()),
+				Value:   should(watObv.Value()),
 			},
 			goherence.TemplateData{
 				Partial: linePartial,
-				Value: should(lineObv.Value()),
+				Value:   should(lineObv.Value()),
 			},
 			goherence.TemplateData{
 				Partial: sendPartial,
-				Value: should(sendObv.Value()),
+				Value:   should(sendObv.Value()),
 			},
 			goherence.TemplateData{
 				Partial: chatPartial,
-				Value: "????",
+				Value:   "????",
 			},
 		})
 		if err != nil {
@@ -168,17 +175,17 @@ func main() {
 	})
 
 	httpSrv = &http.Server{
-		Addr: BindAddr,
+		Addr:    BindAddr,
 		Handler: mux,
 	}
 
 	watWork := marx.Worker(func(ctx context.Context) error {
 		defer fmt.Println("wat on strike")
 
-		ticker := time.Tick(5*time.Second)
+		ticker := time.Tick(5 * time.Second)
 		i := 0
-		for  {
-			select{
+		for {
+			select {
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-ticker:
@@ -222,7 +229,7 @@ func LineObservable(r io.Reader) (luigi.Observable, func(ctx context.Context) er
 		defer fmt.Println("line worker on strike")
 		br := bufio.NewReader(r)
 		for {
-			select{
+			select {
 			case <-ctx.Done():
 				return ctx.Err()
 			default:

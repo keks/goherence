@@ -9,14 +9,10 @@ import (
 	"time"
 
 	"go.cryptoscope.co/luigi"
-	"go.cryptoscope.co/margaret"
-
-	"github.com/keks/marx"
 )
 
 type Server interface {
-	RegisterObservable(id string, rf RenderFunc, obv luigi.Observable) Partial
-	RegisterLog(id string, rf RenderFunc, obv margaret.Log) (Partial, marx.Worker, error)
+	RegisterPartial(Partial) func()
 
 	http.Handler
 }
@@ -25,11 +21,11 @@ func NewServer() Server {
 	var (
 		mux = http.NewServeMux()
 		s   = &server{
-			start:     time.Now(),
-			partials:   map[string]Partial{},
-			httpMux:   mux,
-			c: newCacher(),
-			l: logLocker{&sync.Mutex{}, "server"},
+			start:    time.Now(),
+			partials: map[string]Partial{},
+			httpMux:  mux,
+			c:        newCacher(),
+			l:        &sync.Mutex{},
 		}
 	)
 
@@ -51,61 +47,24 @@ type server struct {
 	c *cacher
 }
 
-func (s *server) RegisterObservable(id string, rf RenderFunc, obv luigi.Observable) Partial {
+func (s *server) RegisterPartial(p Partial) func() {
 	s.l.Lock()
 	defer s.l.Unlock()
 
-	partial := NewObservablePartial(id, rf, obv)
-	s.partials[id] = partial
+	s.partials[p.ID()] = p
 
-	obv.Register(luigi.FuncSink(func(ctx context.Context, v interface{}, err error) error {
+	unreg := p.Register(luigi.FuncSink(func(ctx context.Context, v interface{}, err error) error {
+		fmt.Printf("invalidate sink for %s called with value %v and error %v\n",
+			p.ID(), v, err)
+
 		if err != nil {
-			fmt.Printf("obv handler for %q received an error %s\n", id, err)
 			return nil
 		}
 
-		return s.c.Invalidate(ctx, id)
+		return s.c.Invalidate(ctx, p.InvalidateID())
 	}))
 
-	return partial
-}
-
-func (s *server) RegisterLog(id string, rf RenderFunc, log margaret.Log) (Partial, marx.Worker, error) {
-	s.l.Lock()
-	defer s.l.Unlock()
-
-	partial, partialWorker, err := NewLogPartial(id, rf, log)
-	if err != nil {
-		return nil, nil, err
-	}
-	s.partials[id] = partial
-
-	seq, err := log.Seq().Value()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	src, err := log.Query(margaret.Live(true), margaret.Gt(seq.(margaret.Seq)), margaret.SeqWrap(true))
-	if err != nil {
-		return nil, nil, err
-	}
-
-	var (
-		sink = luigi.FuncSink(func(ctx context.Context, v interface{}, err error) error {
-			if err != nil {
-				fmt.Printf("log handler for %q received an error %s\n", id, err)
-				return nil
-			}
-
-			return s.c.Invalidate(ctx, id + "-latest")
-		})
-
-		invalidateWorker = marx.Worker(func(ctx context.Context) error {
-			return luigi.Pump(ctx, sink, src)
-		})
-	)
-
-	return partial, marx.Unite(invalidateWorker, partialWorker), nil
+	return unreg
 }
 
 func (s *server) servePartialHTTP(w http.ResponseWriter, r *http.Request) {
@@ -113,7 +72,7 @@ func (s *server) servePartialHTTP(w http.ResponseWriter, r *http.Request) {
 	defer s.l.Unlock()
 
 	id := strings.TrimPrefix(r.URL.Path, "/partial/")
-	
+
 	p, ok := s.partials[id]
 	if !ok {
 		http.Error(w, "Not Found", 404)
